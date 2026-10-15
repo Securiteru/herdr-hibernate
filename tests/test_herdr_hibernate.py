@@ -118,7 +118,7 @@ class HibernateTests(unittest.TestCase):
 
     def test_rename_failure_keeps_record_for_retry(self):
         rec = {
-            "uuid": "90141d62-7130-4dd0-8083-211884e8e999",
+            "uuid": "00000000-0000-4000-8000-000000000001",
             "agent": "claude",
             "tab_id": "w1:t1",
             "label": "Original",
@@ -421,7 +421,7 @@ class WatcherGuardTests(unittest.TestCase):
                 mock.patch.object(hibernate, "busy_background_job",
                                   return_value="herdr wait agent-status w1:p2"):
             decision, reason = hibernate.classify(
-                pane, {"w1:t1": "KB Delta orchestrator"}, self._cfg(),
+                pane, {"w1:t1": "Nightly build orchestrator"}, self._cfg(),
                 {}, "w9:p9")
         self.assertEqual(decision, "skip")
         self.assertTrue(reason.startswith("busy:"))
