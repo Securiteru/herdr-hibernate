@@ -1,6 +1,6 @@
 id = "bengemine.hibernate"
 name = "Herdr Hibernate"
-version = "1.2.0"
+version = "1.4.0"
 min_herdr_version = "0.7.0"
 description = "Hibernate idle Claude Code, Codex, and Grok panes to ~0 RAM — kill the process tree, leave a tiny resume stub, press Enter to get the exact session back."
 # Tested on Linux and WSL2. macOS is untested: the background watcher falls back
@@ -32,6 +32,18 @@ contexts = ["pane", "workspace"]
 command = ["./herdr-hibernate", "now"]
 
 [[actions]]
+id = "view"
+title = "Hibernate: cycle agents list (all / running / hibernated)"
+contexts = ["workspace"]
+command = ["./herdr-hibernate", "view"]
+
+[[actions]]
+id = "keep"
+title = "Hibernate: keep focused chat (never auto-settle) on/off"
+contexts = ["pane", "workspace"]
+command = ["./herdr-hibernate", "keep"]
+
+[[actions]]
 id = "restore"
 title = "Hibernate: re-arm stubs"
 contexts = ["workspace"]
@@ -54,3 +66,22 @@ id = "update"
 title = "Hibernate: update plugin"
 contexts = ["workspace"]
 command = ["./herdr-hibernate", "update"]
+
+# Closing a tab, pane or workspace moves its chats to the settled list, which
+# `herdr-hibernate settled` shows (bind it to a popup key, see README).
+[[events]]
+on = "tab.closed"
+command = ["./herdr-hibernate", "on-close"]
+
+[[events]]
+on = "pane.closed"
+command = ["./herdr-hibernate", "on-close"]
+
+[[events]]
+on = "workspace.closed"
+command = ["./herdr-hibernate", "on-close"]
+
+# A close event names only the tab, so each live chat is noted beforehand.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./herdr-hibernate", "remember"]

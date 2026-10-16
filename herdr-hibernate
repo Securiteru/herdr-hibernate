@@ -4,35 +4,46 @@
 Kills the agent process tree of idle panes (freeing 500 MB-2 GB each) and
 replaces it with a tiny bash stub that resumes the exact session on Enter.
 Supports Claude Code, Codex, and Grok; only agents with a proven on-disk
-resume path are ever touched. Panes and tabs are never closed. Dry-run by
-default.
+resume path are ever touched. Hibernation never closes a pane or tab; only
+auto-settle does (AUTO_SETTLE_AFTER_DAYS). Dry-run by default.
 
 Hibernation survives reboots: each hibernated pane gets a stub script under
 ~/.config/herdr-hibernate/panes/. A .bashrc hook re-arms that stub the moment
 Herdr spawns a fresh shell in the pane, and `restore` re-arms any pane whose
 stub died (Herdr restart, machine reboot, stub killed).
 
-Nothing is retained for a closed tab: when a pane disappears its record and
-stub script are deleted outright (after a short grace window), and the log is
-size-capped. The tool only ever holds data for panes that currently exist.
+A hibernated pane stays in Herdr's agent sidebar as "claude 5h20m" (🕸 once
+it is STALE_AFTER_DAYS old), so unfinished work never drops out of sight.
+Closing the tab is how you mark that work done: Herdr's close event moves the
+chat to a settled list, which `settled` shows in a popup where Enter reopens
+one. That list holds each chat's tab name, folder and session id, and drops
+entries after SETTLED_KEEP_DAYS.
+
+Everything else about a closed tab goes: its hibernation record and stub
+script are deleted (after a short grace window), and the log is size-capped.
 
 Subcommands: watch | scan | restore | hibernate <pane_id> | forget <pane_id>
               status | install | uninstall | update [--pull-only]
+              view [all|running|hibernated] | settled | keep
 """
 
 import calendar
 import contextlib
+import curses
 import fcntl
 import glob
 import json
+import locale
 import os
 import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
+import unicodedata
 
 CONFIG_DIR = os.path.expanduser("~/.config/herdr-hibernate")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
@@ -44,11 +55,31 @@ WATCH_LOCK_FILE = os.path.join(CONFIG_DIR, "watch.lock")
 OPERATION_LOCK_FILE = os.path.join(CONFIG_DIR, "operation.lock")
 SYSTEMD_UNIT = os.path.expanduser("~/.config/systemd/user/herdr-hibernate.service")
 UPDATE_CHECK_FILE = os.path.join(CONFIG_DIR, "update-check")
+CHATS_FILE = os.path.join(CONFIG_DIR, "chats.json")
+SETTLED_FILE = os.path.join(CONFIG_DIR, "settled.json")
+SETTLED_LOCK_FILE = os.path.join(CONFIG_DIR, "settled.lock")
+SETTLED_VIEW_FILE = os.path.join(CONFIG_DIR, "settled-view.json")
+KEPT_FILE = os.path.join(CONFIG_DIR, "kept.json")
 SELF = os.path.abspath(__file__)
 REPO_DIR = os.path.dirname(SELF)  # the plugin's own git checkout
 SHELL_HOOK_MARK = "# >>> herdr-hibernate pane stub hook >>>"
 
 UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+# Herdr lists only panes with an agent in them, so a hibernated pane reports
+# this made-up agent to stay listed. Not a real agent name on purpose: Herdr
+# then never mixes it up with its own detection of the agent we resume.
+SLEEP_AGENT = "hibernated"
+SLEEP_SOURCE = "herdr-hibernate"
+
+# Agent-list filters `view` cycles through. Herdr shows the name in the
+# agents header, where it normally shows the sort order.
+VIEWS = (
+    ("all", None),
+    ("running", {"op": "not",
+                 "filter": {"op": "eq", "field": "agent", "value": SLEEP_AGENT}}),
+    ("hibernated", {"op": "eq", "field": "agent", "value": SLEEP_AGENT}),
+)
 
 # Per-agent adapters — herdr's `agent` value -> how to measure idle time, find
 # the process, and resume a killed session. Only agents listed here are ever
@@ -155,6 +186,17 @@ CONFIG_KEYS = [
     ("BUSY_IGNORE_TOKENS", '"mcp"',
      "Space-separated case-insensitive substrings; a child process whose\n"
      "command line matches one is ignored by the background-job check."),
+    ("STALE_AFTER_DAYS", "1",
+     "A hibernated tab whose chat has not been used for this many days\n"
+     "shows 🕸 before its agent name in Herdr's agent sidebar: with the default auto\n"
+     "settle, a day before it is closed. 0 disables the mark."),
+    ("AUTO_SETTLE_AFTER_DAYS", "2",
+     "Close a hibernated tab whose chat has not been used (no new message, no\n"
+     "hibernation) for this many days. Closing settles it: the chat moves to the settled list (F7), where\n"
+     "Enter reopens it. A pinned tab is never closed. 0 turns this off."),
+    ("SETTLED_KEEP_DAYS", "90",
+     "Closing a chat's tab moves it to the settled list (F7 popup). Entries\n"
+     "older than this many days are dropped from that list."),
     ("UPDATE_CHECK_HOURS", "24",
      "Hours between checks for a newer plugin version (a `git fetch` of the\n"
      "plugin's own checkout). A newer version is only announced — log line\n"
@@ -281,26 +323,56 @@ def herdr(*args):
         return {}
 
 
-def load_state():
+def herdr_api(method, params):
+    """One socket request, for API methods the herdr CLI has no command for."""
+    path = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser(
+        "~/.config/herdr/herdr.sock")
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(10)
+        sock.connect(path)
+        sock.sendall((json.dumps({"id": "hibernate", "method": method,
+                                  "params": params}) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    reply = json.loads(buf)
+    if "error" in reply:
+        raise RuntimeError("%s failed: %s" % (
+            method, reply["error"].get("message", reply["error"])))
+    return reply["result"]
+
+
+def load_json(path, default):
     try:
-        with open(STATE_FILE, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, ValueError):
-        return {}
+        return default
 
 
-def save_state(state):
+def save_json(path, data):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    tmp = "%s.tmp.%d" % (STATE_FILE, os.getpid())
+    tmp = "%s.tmp.%d" % (path, os.getpid())
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2)
-        os.replace(tmp, STATE_FILE)
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, path)
     finally:
         try:
             os.remove(tmp)
         except OSError:
             pass
+
+
+def load_state():
+    return load_json(STATE_FILE, {})
+
+
+def save_state(state):
+    save_json(STATE_FILE, state)
 
 
 @contextlib.contextmanager
@@ -496,6 +568,12 @@ def collect_panes():
     return panes, tab_labels
 
 
+def live_agent(pane):
+    """The agent really running in a pane; our own SLEEP_AGENT report is none."""
+    agent = pane.get("agent")
+    return None if agent == SLEEP_AGENT else agent
+
+
 def session_uuid(pane):
     sess = pane.get("agent_session")
     if isinstance(sess, dict) and sess.get("value"):
@@ -689,7 +767,7 @@ def classify(pane, tab_labels, cfg, state, self_pane):
         return "skip", "hibernated (stub waiting for Enter)"
     if pane_id == self_pane:
         return "exempt", "reaper's own pane"
-    agent = pane.get("agent")
+    agent = live_agent(pane)
     if not agent:
         return "skip", "no agent in pane"
     if agent not in AGENTS:
@@ -796,6 +874,8 @@ _hb_stub() {{
     cd {cwd} 2>/dev/null || cd "$HOME" || return 0
     printf '\\n\\033[1;35m%s\\033[0m\\n' {banner}
     printf '\\033[2m%s\\033[0m\\n\\n' {subtitle}
+    # Not in the background: a late report would relist a pane that just woke.
+    {tool} mark-asleep {pane_id} >/dev/null 2>&1
     IFS= read -r _ || return 0
     printf 'resuming session %s (takes 10-20s)...\\n' {uuid}
     {tool} label-awake {pane_id} >/dev/null 2>&1
@@ -991,6 +1071,82 @@ def toast(title, body="", sound="none"):
         pass
 
 
+def kept_ids():
+    """Session ids marked "keep" (F6): they hibernate, but never auto-settle."""
+    return set(load_json(KEPT_FILE, []))
+
+
+def show_kept(pane, kept):
+    """Show a running kept chat as '🔖 claude' in the agents list, or stop.
+
+    A hibernated pane gets its 🔖 from report_asleep instead.
+    """
+    agent = live_agent(pane)
+    if agent not in AGENTS:
+        return
+    want = "🔖 %s" % agent if session_uuid(pane) in kept else None
+    have = pane.get("display_agent") or ""
+    try:
+        if want and have != want:
+            herdr("pane", "report-metadata", pane["pane_id"], "--source",
+                  SLEEP_SOURCE, "--agent", agent, "--display-agent", want)
+        elif not want and have.startswith("🔖"):
+            herdr("pane", "report-metadata", pane["pane_id"], "--source",
+                  SLEEP_SOURCE, "--clear-display-agent")
+    except RuntimeError:
+        pass
+
+
+def untouched_minutes(rec, age):
+    """Minutes since a hibernated chat was last used, or None if it is gone.
+
+    That is its last message, or its hibernation if later: a chat reopened
+    only to read writes no message, yet was just used, and must not be
+    auto-settled straight away for its old last message.
+    """
+    since = since_minutes(rec.get("at"))
+    return age if age is None or since is None else min(age, since)
+
+
+def report_asleep(pane, rec, stale_days, age=None):
+    """Keep a hibernated pane in Herdr's agent sidebar as 'claude 5h20m'."""
+    pane_id = pane["pane_id"]
+    agent = rec.get("agent", "claude")
+    if age is None:
+        age = transcript_age_minutes(rec["uuid"], agent)
+    age = untouched_minutes(rec, age)
+    if rec["uuid"] in kept_ids():
+        icon = "🔖 "
+    elif stale_days > 0 and age is not None and age >= stale_days * 1440:
+        icon = "🕸 "
+    else:
+        icon = ""  # the tab name above already starts with 💤
+    text = "%s%s %s" % (icon, agent, fmt_idle(age))
+    try:
+        if pane.get("agent") != SLEEP_AGENT:
+            # "unknown" draws a dim dot, unlike the ring of a live idle agent.
+            herdr("pane", "report-agent", pane_id, "--source", SLEEP_SOURCE,
+                  "--agent", SLEEP_AGENT, "--state", "unknown")
+        if pane.get("display_agent") != text:
+            herdr("pane", "report-metadata", pane_id, "--source", SLEEP_SOURCE,
+                  "--agent", SLEEP_AGENT, "--display-agent", text)
+    except RuntimeError as exc:
+        log("LIST failed %s (%s): %s" % (rec.get("label", "?"), pane_id, exc),
+            echo=False)
+
+
+def release_asleep(pane_id):
+    """Stop listing a pane as hibernated; Herdr's own detection takes over."""
+    for args in (("release-agent", pane_id, "--source", SLEEP_SOURCE,
+                  "--agent", SLEEP_AGENT),
+                 ("report-metadata", pane_id, "--source", SLEEP_SOURCE,
+                  "--clear-display-agent")):
+        try:
+            herdr("pane", *args)
+        except RuntimeError:
+            pass
+
+
 def build_resume(agent, sid, proc, cwd):
     """Resume argv for a session, with whitelisted flags replayed from the
     process being killed (so e.g. a codex model override survives resume)."""
@@ -1163,6 +1319,7 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
             herdr("tab", "rename", tab_id, marked_label)
     except RuntimeError:
         pass
+    report_asleep(pane, rec, float(cfg["STALE_AFTER_DAYS"]))
     log("HIBERNATED %s (%s, idle %s, freed ~%dMB, killed tree of pid %d [%s])" % (
         label, pane_id, idle_str, rss_mb, pid, detail))
     return True
@@ -1226,19 +1383,21 @@ def match_pane(pane_id, rec, panes):
         if rec.get("tab_id") and pane.get("tab_id") == rec["tab_id"]:
             return pane
     for pane in panes:
-        if (not pane.get("agent") and rec.get("cwd")
+        if (not live_agent(pane) and rec.get("cwd")
                 and pane.get("cwd") == rec["cwd"]
                 and (pane.get("label") or "").lstrip("💤 ") == rec.get("label")):
             return pane
     return None
 
 
-def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
+def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0,
+                    stale_days=0.0):
     """Re-arm hibernated panes whose stub died (Herdr restart / reboot / kill).
 
     This is what makes hibernation survive a machine restart: the stub is just
     a process, so it dies with Herdr — but the state record and the pane's stub
-    script both live on disk, so the pane can always be re-armed.
+    script both live on disk, so the pane can always be re-armed. Each pass
+    also refreshes the age every hibernated pane shows in the agent sidebar.
     """
     restored = 0
     for pane_id in list(state):
@@ -1256,6 +1415,8 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                     "" if gone_for is None else " for %s" % fmt_idle(gone_for)))
             elif forget_after <= 0 or (gone_for is not None
                                        and gone_for >= forget_after):
+                # Catches a close whose Herdr event never ran the hook.
+                settle_closed("pane.closed", {"pane_id": pane_id})
                 forget_record(pane_id, state, "tab closed")
             elif gone_for is None:
                 rec["missing_since"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1265,7 +1426,8 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
             continue
         if rec.pop("missing_since", None) is not None:
             save_state(state)  # pane came back — cancel the pending forget
-        if transcript_age_minutes(rec["uuid"], rec.get("agent", "claude")) is None:
+        age = transcript_age_minutes(rec["uuid"], rec.get("agent", "claude"))
+        if age is None:
             # No transcript means nothing to resume — the record is dead weight.
             if not dry_run:
                 forget_record(pane_id, state, "session transcript is gone")
@@ -1294,7 +1456,12 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                 if fresh:
                     log("ARMED %s (%s): wrote stub script for reboot recovery"
                         % (label, pane_id), echo=False)
+                report_asleep(pane, rec, stale_days, age)
             continue
+        if pane.get("agent") == SLEEP_AGENT and not dry_run:
+            # No stub, yet still listed as asleep: it woke or was dismissed.
+            release_asleep(pane_id)
+            pane = dict(pane, agent=None, display_agent=None)
         if pane.get("agent") == rec.get("agent", "claude"):
             # The agent is live in the pane again — the stub did its job.
             # (Accept any session uuid: right after a resume Herdr may not have
@@ -1307,7 +1474,7 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                 remove_stub_file(pane_id)
                 save_state(state)
             continue
-        if pane.get("agent"):
+        if live_agent(pane):
             if not dry_run:
                 forget_record(pane_id, state,
                               "pane reused by agent %s" % pane.get("agent"))
@@ -1335,12 +1502,382 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                 herdr("tab", "rename", tab_id, "💤 %s" % label)
             except RuntimeError:
                 pass
+        report_asleep(pane, rec, stale_days, age)
         restored += 1
         log("RESTORED %s (%s): re-armed stub for session %s" % (
             label, pane_id, rec["uuid"]))
     if not dry_run:
+        for pane in panes:
+            # Left behind by a record that is gone (forgotten or re-keyed).
+            if pane.get("agent") == SLEEP_AGENT and pane["pane_id"] not in state:
+                release_asleep(pane["pane_id"])
         gc_stub_files(state, panes)
     return restored
+
+
+# ------------------------------------------------------------ settled chats
+
+def pane_workspace(pane_id):
+    """Workspace id of a pane id: 'w1:p3' -> 'w1'."""
+    return pane_id.rsplit(":", 1)[0]
+
+
+def remember_chats(panes, tab_labels, full=True):
+    """Write down each live chat's tab name, folder and session id.
+
+    Herdr's close event names only the tab or pane, and by then the rest is
+    gone, so it has to be on file beforehand. A full pass (the watcher's
+    scan) rewrites the file, which also drops chats that closed unseen.
+    """
+    with file_lock(SETTLED_LOCK_FILE):
+        chats = {} if full else load_json(CHATS_FILE, {})
+        for pane in panes:
+            agent, uuid = live_agent(pane), session_uuid(pane)
+            if agent not in AGENTS or not uuid or not re.fullmatch(UUID_RE, uuid):
+                continue
+            chats[pane["pane_id"]] = {
+                "tab_id": pane.get("tab_id", ""), "agent": agent, "uuid": uuid,
+                "label": tab_labels.get(pane.get("tab_id", ""), "")
+                         or pane.get("label") or "",
+                "cwd": pane.get("cwd") or "",
+            }
+        save_json(CHATS_FILE, chats)
+
+
+def load_settled(keep_days=None):
+    """Settled chats, newest first, minus those older than keep_days."""
+    return [e for e in load_json(SETTLED_FILE, [])
+            if keep_days is None or (since_minutes(e.get("at")) or 0) < keep_days * 1440]
+
+
+def settle_closed(kind, data, keep_days=None):
+    """Move the chats of a closed tab, pane or workspace to the settled list."""
+    field = {"tab.closed": "tab_id", "pane.closed": "pane_id",
+             "workspace.closed": "workspace_id"}.get(kind)
+    if not field or not data.get(field):
+        return
+    with file_lock(SETTLED_LOCK_FILE):
+        chats = load_json(CHATS_FILE, {})
+        known = dict(chats)
+        known.update(load_state())  # a hibernation record knows its chat best
+        settled = load_settled(keep_days)
+        done = {e.get("uuid") for e in settled}
+        moved = []
+        for pane_id, chat in known.items():
+            where = {"pane_id": pane_id, "tab_id": chat.get("tab_id"),
+                     "workspace_id": pane_workspace(pane_id)}
+            if where[field] != data[field]:
+                continue
+            if pane_id not in chats and chat["uuid"] in done:
+                continue  # leftover record of a tab that was settled already
+            settled = [e for e in settled if e.get("uuid") != chat["uuid"]]
+            idle = untouched_minutes(chat, transcript_age_minutes(
+                chat["uuid"], chat.get("agent", "claude"))) or 0
+            settled.insert(0, {
+                "label": chat.get("label", ""), "cwd": chat.get("cwd", ""),
+                "agent": chat.get("agent", "claude"), "uuid": chat["uuid"],
+                "resume": resume_argv(chat),
+                "workspace_id": pane_workspace(pane_id),
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "used": time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(time.time() - idle * 60)),
+            })
+            chats.pop(pane_id, None)
+            moved.append(chat.get("label") or pane_id)
+        if moved:
+            save_json(SETTLED_FILE, settled)
+            save_json(CHATS_FILE, chats)
+            log("SETTLED %s (%s)" % (", ".join(moved), kind), echo=False)
+
+
+def auto_settle(panes, tab_labels, state, cfg, dry_run):
+    """Close hibernated chats left untouched for AUTO_SETTLE_AFTER_DAYS.
+
+    Only that pane closes, so other panes in its tab survive. Closing a
+    running agent never happens: only hibernated panes are candidates, and
+    a chat marked "keep" or a pinned tab is skipped.
+    """
+    days = float(cfg["AUTO_SETTLE_AFTER_DAYS"])
+    if days <= 0:
+        return
+    live = {p["pane_id"]: p for p in panes}
+    kept = kept_ids()
+    for pane_id, rec in list(state.items()):
+        pane = live.get(pane_id)
+        age = untouched_minutes(
+            rec, transcript_age_minutes(rec["uuid"], rec.get("agent", "claude")))
+        if pane is None or age is None or age < days * 1440 or rec["uuid"] in kept:
+            continue
+        label = rec.get("label") or pane_id
+        tab_id = pane.get("tab_id", "")
+        marker = cfg["PIN_MARKER"]
+        if tab_id in cfg["PINNED_TABS"].split() or (
+                marker and marker in tab_labels.get(tab_id, "")):
+            continue
+        if dry_run:
+            log("WOULD auto-settle %s (%s): untouched %s" % (label, pane_id, fmt_idle(age)))
+            continue
+        try:
+            herdr("pane", "close", pane_id)
+        except RuntimeError as exc:
+            log("SKIP auto-settle %s (%s): %s" % (label, pane_id, exc))
+            continue
+        settle_closed("pane.closed", {"pane_id": pane_id})  # in case the hook missed it
+        forget_record(pane_id, state, "auto-settled after %s untouched" % fmt_idle(age))
+
+
+def drop_settled(uuid):
+    with file_lock(SETTLED_LOCK_FILE):
+        save_json(SETTLED_FILE, [e for e in load_json(SETTLED_FILE, [])
+                                 if e.get("uuid") != uuid])
+
+
+def last_reply(uuid, agent):
+    """The chat's last written reply as one line; None if its file is gone."""
+    spec = AGENTS.get(agent)
+    paths = glob.glob(spec["transcript_glob"].format(sid=uuid)) if spec else []
+    if not paths:
+        return None
+    try:
+        with open(paths[0], "rb") as fh:
+            fh.seek(max(0, os.path.getsize(paths[0]) - TAIL_BYTES))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        # claude keeps a reply under "message", codex under "payload".
+        msg = (entry.get("message") or entry.get("payload")
+               if isinstance(entry, dict) else None)
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        parts = msg.get("content") if isinstance(msg.get("content"), list) else []
+        text = " ".join(p.get("text", "") for p in parts if isinstance(p, dict)
+                        and p.get("type") in ("text", "output_text"))
+        if text.strip():
+            # A one-line preview reads better without Markdown's ** ` and #.
+            text = re.sub(r"\*\*|__|`|^#+ ", "", text, flags=re.M)
+            return " ".join(text.split())
+    return ""
+
+
+def reopen_settled(entry):
+    """Resume a settled chat in a new tab, in its old workspace if it still exists."""
+    args = ["tab", "create", "--cwd", entry.get("cwd") or os.path.expanduser("~"),
+            "--label", entry.get("label") or entry["uuid"][:8], "--focus"]
+    spaces = {w["workspace_id"] for w in herdr("workspace", "list")["workspaces"]}
+    if entry.get("workspace_id") in spaces:
+        args += ["--workspace", entry["workspace_id"]]
+    pane_id = herdr(*args)["root_pane"]["pane_id"]
+    herdr("pane", "run", pane_id,
+          " ".join(shlex.quote(t) for t in resume_argv(entry)))
+    drop_settled(entry["uuid"])
+
+
+def cells(text):
+    """Terminal columns a string takes: wide characters such as 📌 take two."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF"
+               else 0 if unicodedata.combining(c) else 1 for c in text)
+
+
+def fit(text, width):
+    """Cut to `width` columns (ending in …) and pad to exactly that width."""
+    if width <= 0:
+        return ""
+    if cells(text) > width:
+        out = ""
+        for ch in text:
+            if cells(out + ch) > width - 1:
+                break
+            out += ch
+        text = out + "…"
+    return text + " " * (width - cells(text))
+
+
+def settled_groups(entries, places):
+    """[(name, entries)] by workspace, or by folder once the workspace is gone.
+
+    Most recently used first, both the groups and the chats inside them.
+    """
+    groups = {}
+    for e in sorted(entries, key=lambda e: e.get("used") or e.get("at") or "",
+                    reverse=True):
+        name = (places.get(e.get("workspace_id"))
+                or os.path.basename(e.get("cwd", "")) or "other")
+        groups.setdefault(name, []).append(e)
+    return list(groups.items())
+
+
+def settled_ui(scr, entries, places):
+    """The F7 popup: settled chats in foldable workspace groups. Enter reopens."""
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    accent = curses.color_pair(1)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    folded = set(load_json(SETTLED_VIEW_FILE, {}).get("folded", []))
+    first_row = object()  # selection marker: jump to the first visible chat
+    query, sel, sel_key, top, note, replies = "", 0, first_row, 0, "", {}
+
+    def put(y, x, text, attr=0):
+        try:
+            scr.addstr(y, x, text, attr)
+        except curses.error:
+            pass  # writing the bottom-right cell always "fails"; the text is shown
+
+    def set_fold(name, fold):
+        (folded.add if fold else folded.discard)(name)
+        save_json(SETTLED_VIEW_FILE, {"folded": sorted(folded)})
+
+    def key_of(kind, val):
+        return (kind, val if kind == "head" else val["uuid"])
+
+    while True:
+        h, w = scr.getmaxyx()
+        words = query.lower().split()
+        groups = settled_groups(entries, places)
+        if words:  # a search opens every group and shows only the matches
+            groups = [(n, [e for e in es if all(
+                word in ("%s %s" % (e.get("label", ""), n)).lower() for word in words)])
+                for n, es in groups]
+            groups = [(n, es) for n, es in groups if es]
+        items, counts, group_of, rows = [], {}, {}, {}
+        for name, members in groups:
+            counts[name] = len(members)
+            if items:
+                items.append(("gap", None))
+            items.append(("head", name))
+            if words or name not in folded:
+                for e in members:
+                    group_of[e["uuid"]], rows[e["uuid"]] = name, e
+                    items.append(("row", e))
+        keys = [key_of(k, v) for k, v in items if k != "gap"]
+        if sel_key is first_row:
+            sel_key = next((k for k in keys if k[0] == "row"), None)
+        if sel_key in keys:
+            sel = keys.index(sel_key)
+        sel = max(0, min(sel, len(keys) - 1))
+        sel_key = keys[sel] if keys else None
+        lines = []  # items, plus the selected chat's last reply under it
+        for k, v in items:
+            lines.append((k, v))
+            if k == "row" and sel_key == ("row", v["uuid"]):
+                lines.append(("reply", v))
+        body_h = max(1, h - 5)
+        if keys:
+            at = next(n for n, (k, v) in enumerate(lines)
+                      if k in ("head", "row") and key_of(k, v) == sel_key)
+            top = min(top, max(0, at - 1))
+            top = max(top, at + (2 if sel_key[0] == "row" else 1) - body_h)
+        top = max(0, min(top, len(lines) - body_h))
+
+        scr.erase()
+        count = "%d chat%s " % (len(entries), "" if len(entries) == 1 else "s")
+        put(0, 1, fit("Settled", w - cells(count) - 2), accent | curses.A_BOLD)
+        put(0, w - cells(count) - 1, count, curses.A_DIM)
+        put(1, 1, "/ ", accent)
+        put(1, 3, fit(query, w - 5) if query else "type to search",
+            0 if query else curses.A_DIM)
+        age_w = 16
+        for y, (kind, val) in enumerate(lines[top:top + body_h], start=3):
+            chosen = kind in ("head", "row") and key_of(kind, val) == sel_key
+            if kind == "head":
+                n = str(counts[val])
+                arrow = "▸" if val in folded and not words else "▾"
+                put(y, 1, fit("%s %s" % (arrow, val), w - 3 - len(n)) + " " + n,
+                    (curses.A_REVERSE if chosen else accent) | curses.A_BOLD)
+            elif kind == "row":
+                used = val.get("used") or val.get("at")
+                age = ("used now" if (since_minutes(used) or 0) < 1
+                       else "used %s ago" % since_str(used))
+                row = "  " + fit(val.get("label") or "(unnamed)", w - age_w - 5) + \
+                    age.rjust(age_w)
+                put(y, 1, fit(row, w - 2), curses.A_REVERSE if chosen else 0)
+            elif kind == "reply":
+                if val["uuid"] not in replies:
+                    replies[val["uuid"]] = last_reply(val["uuid"],
+                                                      val.get("agent", "claude"))
+                reply = replies[val["uuid"]]
+                text = ("(this chat's file is gone, so it can't be reopened)"
+                        if reply is None else '"%s"' % reply if reply else "")
+                put(y, 5, fit(text, w - 7), curses.A_DIM)
+        if not keys:
+            put(4, 2, fit("No settled chat matches that." if entries else
+                          "Nothing settled yet. Close a tab when its work is done.",
+                          w - 3), curses.A_DIM)
+        put(h - 2, 1, fit(note, w - 2), accent)
+        put(h - 1, 1, fit("↑↓ move · ←→ fold · Enter reopen · Del remove · "
+                          "type to search · Esc close", w - 2), curses.A_DIM)
+        scr.refresh()
+
+        try:
+            key = scr.get_wch()
+        except curses.error:
+            continue
+        note, pick = "", None
+        kind = sel_key[0] if sel_key else None
+        steps = {curses.KEY_UP: -1, curses.KEY_DOWN: 1,
+                 curses.KEY_PPAGE: -body_h, curses.KEY_NPAGE: body_h}
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            if kind == "head" and not words:
+                set_fold(sel_key[1], sel_key[1] not in folded)
+            elif kind == "row":
+                pick = rows[sel_key[1]]
+        elif key == "\x1b":
+            if not query:
+                return
+            query, sel_key = "", first_row
+        elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            query, sel_key = query[:-1], first_row
+        elif key == "\x15":  # Ctrl-U
+            query, sel_key = "", first_row
+        elif key in steps and keys:
+            sel_key = keys[max(0, min(sel + steps[key], len(keys) - 1))]
+        elif key == curses.KEY_LEFT and kind and not words:
+            name = sel_key[1] if kind == "head" else group_of[sel_key[1]]
+            set_fold(name, True)
+            sel_key = ("head", name)
+        elif key == curses.KEY_RIGHT and kind == "head" and not words:
+            set_fold(sel_key[1], False)
+        elif key == curses.KEY_DC and kind == "row":
+            drop_settled(sel_key[1])
+            entries.remove(rows[sel_key[1]])
+            sel_key = None  # keeps the position, so the next chat is selected
+            note = "Removed from the list. The chat itself is untouched."
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, _, my, _, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            wheel = (-1 if bstate & curses.BUTTON4_PRESSED else
+                     1 if bstate & getattr(curses, "BUTTON5_PRESSED", 0) else 0)
+            if wheel and keys:
+                sel_key = keys[max(0, min(sel + wheel, len(keys) - 1))]
+            elif 3 <= my < 3 + body_h and top + my - 3 < len(lines):
+                k, v = lines[top + my - 3]
+                if k == "head":
+                    sel_key = ("head", v)
+                    if not words and bstate & (curses.BUTTON1_CLICKED
+                                               | curses.BUTTON1_PRESSED):
+                        set_fold(v, v not in folded)
+                elif k in ("row", "reply"):
+                    sel_key = ("row", v["uuid"])
+                    if bstate & curses.BUTTON1_DOUBLE_CLICKED:
+                        pick = v
+        elif isinstance(key, str) and key.isprintable():
+            query, sel_key, top = query + key, first_row, 0
+        if pick is not None:
+            if last_reply(pick["uuid"], pick.get("agent", "claude")) is None:
+                note = "That chat's file is gone, so it can't be reopened."
+                continue
+            try:
+                reopen_settled(pick)
+                return
+            except (RuntimeError, KeyError) as exc:
+                note = "Could not reopen: %s" % exc
 
 
 # ---------------------------------------------------------------- commands
@@ -1355,7 +1892,13 @@ def cmd_scan(cfg=None):
     # anything else looks at this pane. Restore is never gated by DRY_RUN — it
     # only ever hands panes back the session they already lost.
     restore_records(panes, tab_labels, state,
-                    forget_after=float(cfg["FORGET_AFTER_MINUTES"]))
+                    forget_after=float(cfg["FORGET_AFTER_MINUTES"]),
+                    stale_days=float(cfg["STALE_AFTER_DAYS"]))
+    remember_chats(panes, tab_labels)
+    kept = kept_ids()
+    for pane in panes:
+        show_kept(pane, kept)
+    auto_settle(panes, tab_labels, state, cfg, dry_run)
 
     mode = "DRY-RUN" if dry_run else "LIVE"
     log("--- scan (%s, threshold %sm, %d panes) ---" % (
@@ -1401,10 +1944,11 @@ def cmd_watch():
                 state = load_state()
                 if state:
                     panes, tab_labels = collect_panes()
+                    cfg = load_config()
                     restore_records(
                         panes, tab_labels, state,
-                        forget_after=float(
-                            load_config()["FORGET_AFTER_MINUTES"]))
+                        forget_after=float(cfg["FORGET_AFTER_MINUTES"]),
+                        stale_days=float(cfg["STALE_AFTER_DAYS"]))
             run_locked(startup_restore)
         except Exception as exc:
             log("startup restore failed: %s" % exc)
@@ -1466,7 +2010,8 @@ def cmd_hibernate(pane_id, force=False, notify=False):
     state = load_state()
     panes, tab_labels = collect_panes()
     restore_records(panes, tab_labels, state,
-                    forget_after=float(cfg["FORGET_AFTER_MINUTES"]))
+                    forget_after=float(cfg["FORGET_AFTER_MINUTES"]),
+                    stale_days=float(cfg["STALE_AFTER_DAYS"]))
     pane = next((p for p in panes if p["pane_id"] == pane_id), None)
     if pane is None:
         fail("no such pane: %s" % pane_id)
@@ -1502,8 +2047,10 @@ def cmd_restore(dry_run=False):
         print("nothing hibernated")
         return
     panes, tab_labels = collect_panes()
+    cfg = load_config()
     n = restore_records(panes, tab_labels, state, dry_run=dry_run,
-                        forget_after=float(load_config()["FORGET_AFTER_MINUTES"]))
+                        forget_after=float(cfg["FORGET_AFTER_MINUTES"]),
+                        stale_days=float(cfg["STALE_AFTER_DAYS"]))
     print("restore: %d pane(s) re-armed, %d hibernated record(s) tracked" % (
         n, len(load_state())))
 
@@ -1528,6 +2075,7 @@ def cmd_label_awake(pane_id):
     the pane's resume stamp is written (see agent_age_minutes).
     """
     write_resume_stamp(pane_id)
+    release_asleep(pane_id)
     state = load_state()
     rec = state.get(pane_id)
     if not rec:
@@ -1538,6 +2086,123 @@ def cmd_label_awake(pane_id):
         pane = {"tab_id": rec.get("tab_id", "")}
     if not restore_owned_tab_label(pane_id, pane, rec, state):
         sys.exit(1)
+
+
+def cmd_mark_asleep(pane_id):
+    """List this hibernated pane in the agent sidebar (each stub calls it on start)."""
+    rec = load_state().get(pane_id)
+    if not rec:
+        return
+    try:
+        pane = herdr("pane", "get", pane_id).get("pane")
+    except RuntimeError:
+        return
+    if pane:
+        report_asleep(pane, rec, float(load_config()["STALE_AFTER_DAYS"]))
+
+
+def current_view():
+    """Name of the agent-list filter this tool has set, or 'all'."""
+    # A clear sent under another owner's name changes nothing but reports
+    # the active filter — the only way Herdr lets a client read it.
+    view = herdr_api("agent.view.clear", {"source": SLEEP_SOURCE + "-probe"})
+    if view.get("active") and view.get("source") == SLEEP_SOURCE:
+        return view.get("label", "all")
+    return "all"
+
+
+def cmd_view(name=None):
+    """Filter the agents list; with no name, step to the next filter (F8)."""
+    names = [n for n, _ in VIEWS]
+    try:
+        if name is None:
+            cur = current_view()
+            name = names[(names.index(cur) + 1) % len(names) if cur in names else 1]
+        if name not in names:
+            sys.exit("usage: herdr-hibernate view [%s]" % "|".join(names))
+        filt = dict(VIEWS)[name]
+        if filt is None:
+            herdr_api("agent.view.clear", {"source": SLEEP_SOURCE})
+        else:
+            herdr_api("agent.view.set", {"source": SLEEP_SOURCE, "label": name,
+                                         "filter": filt})
+    except (OSError, ValueError, RuntimeError) as exc:
+        toast("Agent filter failed", str(exc)[:120], sound="request")
+        sys.exit(1)
+
+
+def cmd_settled():
+    """Browse settled chats in a popup (F7); Enter reopens one in a new tab."""
+    entries = load_settled(float(load_config()["SETTLED_KEEP_DAYS"]))
+    try:
+        places = {w["workspace_id"]: w.get("label", "")
+                  for w in herdr("workspace", "list")["workspaces"]}
+    except (RuntimeError, KeyError):
+        places = {}
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")  # Esc closes at once, not after 1s
+    curses.wrapper(settled_ui, entries, places)
+
+
+def cmd_keep():
+    """Toggle "keep" on the focused chat (F6): it may hibernate, never auto-settles.
+
+    Keyed by session id, so it survives Herdr restarts and renamed tabs.
+    """
+    try:
+        pane = herdr("pane", "current").get("pane") or {}
+    except RuntimeError as exc:
+        toast("Keep failed", str(exc)[:120], sound="request")
+        sys.exit(1)
+    rec = load_state().get(pane.get("pane_id", ""))
+    if rec and live_agent(pane):  # woke up; its record lasts until the next scan
+        uuid, rec = session_uuid(pane) or rec["uuid"], None
+    else:
+        uuid = rec["uuid"] if rec else session_uuid(pane)
+    if not uuid:
+        toast("Nothing to keep", "this pane has no chat that can be resumed",
+              sound="request")
+        sys.exit(1)
+    with file_lock(SETTLED_LOCK_FILE):
+        kept = kept_ids() ^ {uuid}
+        save_json(KEPT_FILE, sorted(kept))
+    if rec:  # hibernated: its sidebar row switches between 🔖 and 💤 now
+        report_asleep(pane, rec, float(load_config()["STALE_AFTER_DAYS"]))
+    else:
+        show_kept(pane, kept)
+    toast("🔖 Kept — never auto-settled" if uuid in kept
+          else "No longer kept — auto-settle applies again",
+          (rec or {}).get("label") or "")
+
+
+def event_data():
+    """(event name, data) of the Herdr event that started this hook."""
+    try:
+        payload = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}")
+    except ValueError:
+        payload = {}
+    return (os.environ.get("HERDR_PLUGIN_EVENT") or payload.get("event", ""),
+            payload.get("data") or {})
+
+
+def cmd_on_close():
+    """Event hook: a tab, pane or workspace closed, so its chats are settled."""
+    kind, data = event_data()
+    settle_closed(kind, data, float(load_config()["SETTLED_KEEP_DAYS"]))
+
+
+def cmd_remember():
+    """Event hook: an agent changed state, so note its chat in case it closes."""
+    _, data = event_data()
+    if not data.get("pane_id"):
+        return
+    try:
+        pane = herdr("pane", "get", data["pane_id"]).get("pane") or {}
+        tab = herdr("tab", "get", pane["tab_id"]).get("tab") or {}
+    except (RuntimeError, KeyError):
+        return
+    remember_chats([pane], {pane["tab_id"]: tab.get("label", "")}, full=False)
+    show_kept(pane, kept_ids())  # a kept chat just resumed gets its 🔖 back
 
 
 SHELL_HOOK = """%s
@@ -1600,7 +2265,7 @@ def cmd_status():
         pane_id = pane["pane_id"]
         label = (tab_labels.get(pane.get("tab_id", ""), "")
                  or pane.get("label", "") or "(unnamed)")[:28]
-        agent = pane.get("agent") or ""
+        agent = live_agent(pane) or ""
         status = pane.get("agent_status", "-") if agent else "-"
         uuid = session_uuid(pane)
         idle = (fmt_idle(transcript_age_minutes(uuid, agent))
@@ -1963,6 +2628,20 @@ def main():
         if len(args) < 2:
             sys.exit("usage: herdr-hibernate label-awake <pane_id>")
         run_locked(cmd_label_awake, args[1])
+    elif cmd == "mark-asleep":
+        if len(args) < 2:
+            sys.exit("usage: herdr-hibernate mark-asleep <pane_id>")
+        cmd_mark_asleep(args[1])
+    elif cmd == "view":
+        cmd_view(args[1] if len(args) > 1 else None)
+    elif cmd == "settled":
+        cmd_settled()
+    elif cmd == "keep":
+        cmd_keep()
+    elif cmd == "on-close":
+        cmd_on_close()
+    elif cmd == "remember":
+        cmd_remember()
     elif cmd == "status":
         cmd_status()
     elif cmd == "ensure":

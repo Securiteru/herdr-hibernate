@@ -18,7 +18,14 @@ Only agents with a proven on-disk resume path are ever touched; anything else
 is exempt — killing a session that cannot be resumed would lose the
 conversation.
 
-Panes and tabs are **never closed** — only processes inside them are killed.
+Hibernation **never closes** a pane or tab — only processes inside them are
+killed. The one thing that closes a tab is auto-settle, below.
+
+Hibernated tabs **stay in Herdr's agent sidebar** as `claude 5h20m`, so
+unfinished work never drops out of sight. When the work is done, close the tab:
+the chat moves to a **settled list** you can browse and reopen from. A
+hibernated chat left untouched for `AUTO_SETTLE_AFTER_DAYS` (default 2) is
+settled for you. See [Open work stays listed](#open-work-stays-listed).
 
 Hibernation **survives a reboot**: the stub is only a process, so it dies when
 Herdr or the machine goes down, but the pane's resume instructions live on disk
@@ -149,6 +156,9 @@ take effect without a restart.
 | `LOG_MAX_KB` | `512` | Rotate the log past this size (one backup kept). |
 | `BUSY_CHILD_MINUTES` | `3` | A child process started this many minutes after its agent marks the pane as running a background job — never hibernated while it lives. `0` disables. |
 | `BUSY_IGNORE_TOKENS` | `mcp` | Space-separated case-insensitive substrings; matching child processes are ignored by the background-job check. |
+| `STALE_AFTER_DAYS` | `1` | A hibernated tab whose chat has not been used for this many days shows `🕸` instead of `💤` in the agent sidebar — with the default auto-settle, a day before it is closed. `0` disables the mark. |
+| `AUTO_SETTLE_AFTER_DAYS` | `2` | Close a hibernated tab whose chat has not been used (no new message, no hibernation) for this many days; the chat moves to the settled list. Pinned tabs are never closed. `0` turns this off. |
+| `SETTLED_KEEP_DAYS` | `90` | Drop settled-list entries older than this. |
 | `UPDATE_CHECK_HOURS` | `24` | How often the watcher checks GitHub for a newer version. It only announces one (log + toast), never installs it. `0` disables. |
 
 New keys added by an upgrade are appended to your existing config file, with
@@ -165,12 +175,16 @@ Everything lives under `~/.config/herdr-hibernate/`:
 | `panes/<pane_id>.resumed` | When that pane's stub last fired (one timestamp). | Deleted when the pane is hibernated again or its tab closes. |
 | `hibernate.log` | What the tool did. | Size-capped by `LOG_MAX_KB`, one rotation. |
 | `config` | Your settings. | Permanent (it's yours). |
+| `chats.json` | Each **running** chat's tab id, tab name, folder and session id — Herdr's close event names only the tab, so this is noted beforehand. | Rewritten every watcher pass; an entry goes when its tab closes. |
+| `settled.json` | The settled list: tab name, folder, workspace id, session id, resume command, and when each closed chat was settled and last used. | `SETTLED_KEEP_DAYS`; an entry also goes when you reopen or remove it. |
+| `settled-view.json` | Which workspace groups you folded in the settled list. | Until you unfold them. |
+| `kept.json` | Session ids of kept chats. | Until you unkeep them. |
 
-**Closing a tab erases it.** When a pane disappears, its record and stub script
-are deleted outright — no archive, no graveyard file. The tool never holds data
-for a tab that isn't open. Records are also erased when the session resumes,
-when the pane gets reused by another agent, or when the session transcript is
-gone (nothing left to resume).
+**Closing a tab settles it.** Its record and stub script are deleted, and the
+chat's name, folder and session id move to `settled.json`. Nothing else about
+the tab is kept. Records are also erased when the session resumes, when the
+pane gets reused by another agent, or when the session transcript is gone
+(nothing left to resume).
 
 `FORGET_AFTER_MINUTES` is a safety margin, not retention: a pane must be
 *missing* that long before erasure, so a half-started Herdr reporting an
@@ -199,7 +213,12 @@ hibernation.
 
 ## Pinning
 
-Two mechanisms:
+A pinned tab is **never hibernated**: its agent keeps running and keeps its
+memory. Since it never hibernates, auto-settle never closes it either. To let
+a tab hibernate but never be auto-settled, use **keep** instead — see
+[Keep a chat](#keep-a-chat).
+
+Two ways to pin:
 
 1. **`PINNED_TABS`** — a list of tab ids in the config. Simple, but **tab ids
    can change when Herdr restarts**, so a pin by id can silently detach from
@@ -264,6 +283,7 @@ wake-up always lands before the pane can qualify.
    `💤 hibernated 2h14m ago (freed ~880MB) — press Enter to resume`.
    It is one small bash process waiting on stdin.
 6. The tab is renamed `💤 <old label>` so hibernated tabs are obvious.
+7. The pane is listed in Herdr's agent sidebar as `claude 2h14m`, under its `💤` tab name.
 
 ## Resume
 
@@ -283,6 +303,117 @@ Press Enter in the pane. The stub restores the tab label and
   session: `exec` keeps the stub's start time, so a stub that waited three
   days would otherwise make a ten-second-old claude look three days old and
   get it killed on the next scan.
+
+## Open work stays listed
+
+Herdr's agent sidebar shows only panes with an agent running in them, so a
+hibernated tab used to vanish from it — and with it, the reminder that the
+work was unfinished. Now every hibernated pane reports itself to Herdr as an
+agent called `hibernated`:
+
+| Sidebar row | Meaning |
+|---|---|
+| `claude 5h20m` | Hibernated, last used 5h20m ago: its last message, or its hibernation if that came later. |
+| `🕸 claude 1d04h` | Hibernated, and older than `STALE_AFTER_DAYS` — auto-settle closes it soon. |
+| `🔖 claude 6d02h` | Hibernated and kept: auto-settle never closes it. |
+
+The row uses Herdr's "unknown" state, so it draws a dim dot instead of the
+ring of a live idle agent. The stub reports itself the moment it starts
+(including after a reboot), each watcher pass refreshes the age, and the stub
+takes the row back off just before it resumes the agent.
+
+**Finished work: close the tab.** A tab that is still open is work you have
+not finished. Closing a tab, a pane or a whole workspace moves its chats to the
+settled list — Herdr's close event runs the plugin's `on-close` hook. Closing
+never deletes a chat: the transcript is the agent's own file.
+
+**Auto-settle.** Each watcher pass closes the pane of any hibernated chat not
+used for `AUTO_SETTLE_AFTER_DAYS` (default 2) — no new message, and not
+hibernated within that time either, so a chat you reopen just to read gets
+the full wait again. Only that pane closes, so other panes in its tab stay.
+Running agents are never touched, and neither are kept chats or pinned tabs.
+Set `0` to turn auto-settle off.
+
+### Keep a chat
+
+`herdr-hibernate keep` (bind it to a key, e.g. F6) marks the focused chat as
+**kept**, or unmarks it. A kept chat still hibernates and frees its memory, but
+auto-settle never closes it. Its row in the agents list shows `🔖 claude`
+while it runs and `🔖 claude 3d04h` while it is hibernated, so you can see the
+mark at a glance. The mark is stored by session id in `kept.json`, so it
+survives Herdr restarts and tab renames. A Herdr notification also confirms
+each press (with `ui.toast.delivery = "system"` it goes to the OS instead).
+
+| | Hibernates (frees memory) | Auto-settled |
+|---|---|---|
+| Normal tab | Yes, when idle | Yes, after `AUTO_SETTLE_AFTER_DAYS` |
+| Kept chat (🔖) | Yes, when idle | Never |
+| Pinned tab (📌) | Never | Never |
+
+```toml
+[[keys.command]]
+key = "f6"
+type = "plugin_action"
+command = "bengemine.hibernate.keep"
+description = "keep chat on/off"
+```
+
+### The settled list
+
+`herdr-hibernate settled` opens a searchable list of settled chats, grouped by
+workspace (or by folder once the workspace is gone). Groups and the chats in
+them are ordered by when each chat was last used. The selected chat shows its
+last reply, so you remember what it was about.
+
+| Key | Does |
+|---|---|
+| ↑ ↓, PgUp PgDn, mouse wheel | Move |
+| ← → | Fold or unfold the selected chat's workspace group |
+| Enter, click on a group header | Fold or unfold that group |
+| Enter, double-click on a chat | Reopen the chat in a new tab, in its old workspace and folder |
+| Typing | Search by tab name or workspace |
+| Delete | Remove it from the list (the chat itself is untouched) |
+| Esc | Clear the search, then close |
+
+Bind it to a popup key in `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "f7"
+type = "popup"
+command = "/path/to/herdr-hibernate settled"
+description = "settled chats"
+width = "70%"
+height = "75%"
+```
+
+`herdr plugin list` shows the plugin's directory, which holds the script. A
+reopened chat leaves the list; close it again to settle it again.
+
+### Filter the agents list
+
+`herdr-hibernate view` steps the agents list through three filters:
+
+| Press | Agents list shows | Header label |
+|---|---|---|
+| 1st | Running agents only | `running` |
+| 2nd | Hibernated tabs only — your unfinished work | `hibernated` |
+| 3rd | Everything again | your sort order |
+
+`view all`, `view running` and `view hibernated` jump straight to one.
+Bind it to a key the same way as `now`:
+
+```toml
+[[keys.command]]
+key = "f8"
+type = "plugin_action"
+command = "bengemine.hibernate.view"
+description = "cycle agents list"
+```
+
+Herdr forgets the filter when its server restarts, and the list shows
+everything again. The tool keeps no copy of the filter: it asks Herdr which
+one is active, so the next press always starts from what you see.
 
 ## Surviving restarts
 
@@ -352,8 +483,11 @@ herdr plugin install bengemine/herdr-hibernate --yes
 
 ## Limitations
 
-- A hibernated pane has no agent process, so it loses its Herdr agent-status
-  badge until resumed. The `💤` tab label is the visual substitute.
+- A hibernated pane has no agent process, so Herdr's own status badge is
+  gone until resume. The `hibernated` sidebar row stands in for it. That row
+  is tested on Herdr 0.8.2. Herdr 0.9.2 started clearing self-reported agents
+  once a pane is back at an idle shell; the stub is a child process rather
+  than the shell itself, so it should keep its row, but that is unverified.
 - The `.bashrc` hook is bash-only. If you switch Herdr's shell to zsh or fish,
   port the hook to that shell's rc file or reboot recovery falls back to the
   slower `restore` sweep.

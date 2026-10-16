@@ -28,6 +28,11 @@ class HibernateTests(unittest.TestCase):
             WATCH_LOCK_FILE=os.path.join(root, "watch.lock"),
             OPERATION_LOCK_FILE=os.path.join(root, "operation.lock"),
             UPDATE_CHECK_FILE=os.path.join(root, "update-check"),
+            CHATS_FILE=os.path.join(root, "chats.json"),
+            SETTLED_FILE=os.path.join(root, "settled.json"),
+            SETTLED_LOCK_FILE=os.path.join(root, "settled.lock"),
+            SETTLED_VIEW_FILE=os.path.join(root, "settled-view.json"),
+            KEPT_FILE=os.path.join(root, "kept.json"),
         )
         self.paths.start()
 
@@ -184,12 +189,398 @@ class HibernateTests(unittest.TestCase):
                       "    _hb_reset_terminal", body)
         self.assertNotIn("\n    clear", body)
 
+    def test_stub_lists_itself_before_waiting_for_enter(self):
+        rec = {
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "agent": "claude", "cwd": "/tmp", "freed_mb": 100,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(hibernate.write_stub_file("w1:p1", rec),
+                  encoding="utf-8") as fh:
+            body = fh.read()
+        mark = body.index("mark-asleep")
+        self.assertLess(mark, body.index("IFS= read"))
+        self.assertFalse(body[mark:body.index("\n", mark)].endswith("&"))
+
     def test_arm_command_resets_terminal_before_starting_stub(self):
         command = hibernate.stub_command("w1:p1")
 
         self.assertLess(command.index("stty sane"), command.index("bash "))
         self.assertIn("\\033[?1004l", command)
         self.assertNotIn("clear", command)
+
+
+class SleepListTests(unittest.TestCase):
+    """Hibernated panes stay in Herdr's agent sidebar until their tab closes."""
+    setUp = HibernateTests.setUp
+    tearDown = HibernateTests.tearDown
+
+    REC = {
+        "uuid": "11111111-1111-1111-1111-111111111111", "agent": "claude",
+        "tab_id": "w1:t1", "label": "Review", "cwd": "/tmp",
+        "marker_added": True, "marked_label": "💤 Review",
+        "freed_mb": 700, "at": "2026-01-01 00:00:00",
+    }
+    BARE = {"foreground_processes": [{"name": "bash", "argv": ["bash"],
+                                      "pid": 5}], "shell_pid": 5}
+
+    @staticmethod
+    def _stub():
+        # STUB_MARKERS is fixed at import, so match its legacy arg0 marker.
+        return {"foreground_processes": [{"cmdline": "hibernate-stub w1:p1"}]}
+
+    def _restore(self, pane, info, age, stale_days=2.0):
+        state = {"w1:p1": dict(self.REC)}
+        with mock.patch.object(hibernate, "herdr") as herdr, \
+                mock.patch.object(hibernate, "transcript_age_minutes",
+                                  return_value=age), \
+                mock.patch.object(hibernate, "pane_process_info",
+                                  return_value=info), \
+                mock.patch.object(hibernate, "gc_stub_files"), \
+                mock.patch.object(hibernate, "log"):
+            hibernate.restore_records([pane], {"w1:t1": "💤 Review"}, state,
+                                      stale_days=stale_days)
+        return state, [c.args for c in herdr.call_args_list]
+
+    def test_live_stub_is_listed_with_its_age(self):
+        pane = {"pane_id": "w1:p1", "tab_id": "w1:t1"}
+        _, calls = self._restore(pane, self._stub(), age=90)
+        self.assertIn(("pane", "report-agent", "w1:p1", "--source",
+                       hibernate.SLEEP_SOURCE, "--agent", hibernate.SLEEP_AGENT,
+                       "--state", "unknown"), calls)
+        self.assertIn("claude 1h30m", calls[-1])
+
+    def test_old_chat_gets_the_stale_mark(self):
+        pane = {"pane_id": "w1:p1", "tab_id": "w1:t1",
+                "agent": hibernate.SLEEP_AGENT}
+        _, calls = self._restore(pane, self._stub(), age=3 * 1440)
+        self.assertNotIn("report-agent", [c[1] for c in calls])  # already listed
+        self.assertIn("🕸 claude 3d00h", calls[-1])
+
+    def test_zero_stale_days_never_marks(self):
+        pane = {"pane_id": "w1:p1", "tab_id": "w1:t1"}
+        _, calls = self._restore(pane, self._stub(), age=30 * 1440, stale_days=0)
+        self.assertEqual(calls[-1][-1], "claude 30d00h")
+
+    def test_sleep_report_is_not_mistaken_for_a_new_agent(self):
+        # Stub dismissed with Ctrl-C: the pane still carries our own report.
+        # It must be re-armed, never forgotten as "reused by another agent".
+        pane = {"pane_id": "w1:p1", "tab_id": "w1:t1",
+                "agent": hibernate.SLEEP_AGENT}
+        state, calls = self._restore(pane, self.BARE, age=90)
+        self.assertIn("w1:p1", state)
+        verbs = [c[1] for c in calls]
+        self.assertLess(verbs.index("release-agent"), verbs.index("run"))
+        self.assertIn("report-agent", verbs[verbs.index("run"):])
+
+    def test_leftover_report_without_a_record_is_released(self):
+        pane = {"pane_id": "w1:p9", "tab_id": "w1:t9",
+                "agent": hibernate.SLEEP_AGENT}
+        with mock.patch.object(hibernate, "herdr") as herdr, \
+                mock.patch.object(hibernate, "gc_stub_files"):
+            hibernate.restore_records([pane], {}, {})
+        self.assertEqual(herdr.call_args_list[0].args[:3],
+                         ("pane", "release-agent", "w1:p9"))
+
+    def test_classify_treats_a_sleep_report_as_no_agent(self):
+        pane = {"pane_id": "w1:p9", "agent": hibernate.SLEEP_AGENT}
+        decision, _ = hibernate.classify(pane, {}, dict(hibernate.DEFAULTS),
+                                         {}, "")
+        self.assertEqual(decision, "skip")
+
+
+class SettledTests(unittest.TestCase):
+    """Closing a tab moves its chat to the settled list the F7 popup shows."""
+    setUp = HibernateTests.setUp
+    tearDown = HibernateTests.tearDown
+
+    SID = "11111111-1111-1111-1111-111111111111"
+    SID2 = "22222222-2222-2222-2222-222222222222"
+
+    def _live(self, pane_id, tab_id, sid, agent="claude"):
+        return {"pane_id": pane_id, "tab_id": tab_id, "agent": agent,
+                "cwd": "/work", "agent_session": {"value": sid}}
+
+    def _settled(self):
+        return hibernate.load_settled(90)
+
+    def test_closing_a_tab_settles_its_remembered_chat(self):
+        hibernate.remember_chats([self._live("w1:p1", "w1:t1", self.SID)],
+                                 {"w1:t1": "Review PR"})
+        hibernate.settle_closed("tab.closed", {"tab_id": "w1:t1"}, 90)
+        [entry] = self._settled()
+        self.assertEqual((entry["label"], entry["uuid"], entry["workspace_id"]),
+                         ("Review PR", self.SID, "w1"))
+        self.assertEqual(entry["resume"], ["claude", "--resume", self.SID])
+        self.assertEqual(hibernate.load_json(hibernate.CHATS_FILE, None), {})
+
+    def test_hibernated_chat_settles_from_its_record(self):
+        hibernate.save_state({"w1:p2": {
+            "uuid": self.SID, "agent": "codex", "tab_id": "w1:t2",
+            "label": "Codex task", "cwd": "/work",
+            "resume": ["codex", "resume", self.SID, "-m", "x"]}})
+        hibernate.settle_closed("pane.closed", {"pane_id": "w1:p2"}, 90)
+        [entry] = self._settled()
+        self.assertEqual(entry["label"], "Codex task")
+        self.assertEqual(entry["resume"][-2:], ["-m", "x"])
+
+    def test_closing_a_workspace_settles_every_chat_in_it(self):
+        hibernate.remember_chats(
+            [self._live("w1:p1", "w1:t1", self.SID),
+             self._live("w2:p1", "w2:t1", self.SID2)], {})
+        hibernate.settle_closed("workspace.closed", {"workspace_id": "w1"}, 90)
+        self.assertEqual([e["uuid"] for e in self._settled()], [self.SID])
+
+    def test_leftover_record_does_not_settle_twice(self):
+        hibernate.save_state({"w1:p2": {"uuid": self.SID, "tab_id": "w1:t2",
+                                         "label": "x"}})
+        hibernate.settle_closed("tab.closed", {"tab_id": "w1:t2"}, 90)
+        first = self._settled()[0]["at"]
+        with mock.patch.object(hibernate.time, "strftime",
+                               return_value="2099-01-01 00:00:00"):
+            hibernate.settle_closed("workspace.closed", {"workspace_id": "w1"}, 90)
+        self.assertEqual([e["at"] for e in self._settled()], [first])
+
+    def test_remember_skips_panes_it_could_not_resume(self):
+        hibernate.remember_chats([
+            self._live("w1:p1", "w1:t1", "not-a-uuid"),
+            self._live("w1:p2", "w1:t2", self.SID, agent="hibernated"),
+            self._live("w1:p3", "w1:t3", self.SID, agent="unknown-agent"),
+        ], {})
+        self.assertEqual(hibernate.load_json(hibernate.CHATS_FILE, None), {})
+
+    def test_old_entries_drop_off_the_list(self):
+        hibernate.save_json(hibernate.SETTLED_FILE, [
+            {"uuid": self.SID, "at": time.strftime("%Y-%m-%d %H:%M:%S")},
+            {"uuid": self.SID2, "at": "2000-01-01 00:00:00"}])
+        self.assertEqual([e["uuid"] for e in self._settled()], [self.SID])
+
+    def test_last_reply_reads_claude_and_codex_transcripts(self):
+        root = self.tempdir.name
+        claude = os.path.join(root, self.SID + ".jsonl")
+        with open(claude, "w", encoding="utf-8") as fh:
+            fh.write('{"type":"assistant","message":{"role":"assistant",'
+                     '"content":[{"type":"text","text":"All  done.\\nPR posted."}]}}\n'
+                     '{"type":"assistant","message":{"role":"assistant",'
+                     '"content":[{"type":"tool_use","name":"Bash"}]}}\n')
+        codex = os.path.join(root, "rollout-%s.jsonl" % self.SID2)
+        with open(codex, "w", encoding="utf-8") as fh:
+            fh.write('{"payload":{"type":"message","role":"assistant",'
+                     '"content":[{"type":"output_text","text":"Fixed it."}]}}\n')
+        agents = {"claude": dict(hibernate.AGENTS["claude"],
+                                 transcript_glob=os.path.join(root, "{sid}.jsonl")),
+                  "codex": dict(hibernate.AGENTS["codex"],
+                                transcript_glob=os.path.join(root, "rollout-{sid}.jsonl"))}
+        with mock.patch.dict(hibernate.AGENTS, agents):
+            self.assertEqual(hibernate.last_reply(self.SID, "claude"),
+                             "All done. PR posted.")
+            self.assertEqual(hibernate.last_reply(self.SID2, "codex"), "Fixed it.")
+            self.assertIsNone(hibernate.last_reply(
+                "33333333-3333-3333-3333-333333333333", "claude"))
+
+    def test_fit_counts_wide_characters_as_two_columns(self):
+        self.assertEqual(hibernate.fit("📌 ab", 6), "📌 ab ")
+        self.assertEqual(hibernate.fit("abcdefgh", 5), "abcd…")
+
+    def test_on_close_reads_herdrs_event_payload(self):
+        hibernate.remember_chats([self._live("w1:p1", "w1:t1", self.SID)], {})
+        env = {"HERDR_PLUGIN_EVENT": "tab.closed",
+               "HERDR_PLUGIN_EVENT_JSON": '{"event":"tab.closed","data":'
+               '{"type":"tab_closed","tab_id":"w1:t1","workspace_id":"w1"}}'}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(hibernate, "load_config",
+                                  return_value=dict(hibernate.DEFAULTS)):
+            hibernate.cmd_on_close()
+        self.assertEqual([e["uuid"] for e in self._settled()], [self.SID])
+
+    # -- auto settle: hibernated chats untouched for AUTO_SETTLE_AFTER_DAYS
+
+    def _auto(self, age_days, tab_label="Old work", dry_run=False, **cfg):
+        state = {"w1:p1": {"uuid": self.SID, "agent": "claude",
+                           "tab_id": "w1:t1", "label": "Old work", "cwd": "/w"}}
+        hibernate.save_state(state)
+        conf = dict(hibernate.DEFAULTS, **cfg)
+        with mock.patch.object(hibernate, "herdr") as herdr, \
+                mock.patch.object(hibernate, "transcript_age_minutes",
+                                  return_value=age_days * 1440):
+            hibernate.auto_settle([{"pane_id": "w1:p1", "tab_id": "w1:t1"}],
+                                  {"w1:t1": tab_label}, state, conf, dry_run)
+        return state, [c.args for c in herdr.call_args_list]
+
+    def test_old_hibernated_chat_is_closed_and_settled(self):
+        state, calls = self._auto(age_days=3)
+        self.assertEqual(calls, [("pane", "close", "w1:p1")])
+        self.assertEqual(state, {})
+        self.assertEqual([e["uuid"] for e in self._settled()], [self.SID])
+
+    def test_recent_chat_stays_open(self):
+        state, calls = self._auto(age_days=1.5)
+        self.assertEqual(calls, [])
+        self.assertIn("w1:p1", state)
+
+    def test_chat_reopened_just_to_read_gets_the_full_wait(self):
+        # Last message 10 days old, but hibernated (so last used) an hour ago.
+        state = {"w1:p1": {"uuid": self.SID, "tab_id": "w1:t1", "label": "x",
+                           "at": time.strftime("%Y-%m-%d %H:%M:%S",
+                                               time.localtime(time.time() - 3600))}}
+        with mock.patch.object(hibernate, "herdr") as herdr, \
+                mock.patch.object(hibernate, "transcript_age_minutes",
+                                  return_value=10 * 1440):
+            hibernate.auto_settle([{"pane_id": "w1:p1", "tab_id": "w1:t1"}], {},
+                                  state, dict(hibernate.DEFAULTS), False)
+        herdr.assert_not_called()
+
+    def test_kept_chat_is_never_auto_settled(self):
+        hibernate.save_json(hibernate.KEPT_FILE, [self.SID])
+        state, calls = self._auto(age_days=30)
+        self.assertEqual(calls, [])
+        self.assertIn("w1:p1", state)
+
+    def test_keep_toggles_on_the_focused_chat_and_shows_in_the_sidebar(self):
+        hibernate.save_state({"w1:p1": {"uuid": self.SID, "agent": "claude",
+                                         "label": "Old work"}})
+        pane = {"pane_id": "w1:p1", "agent": hibernate.SLEEP_AGENT}
+
+        def fake_herdr(*args):
+            return {"pane": pane} if args[:2] == ("pane", "current") else {}
+
+        with mock.patch.object(hibernate, "herdr", side_effect=fake_herdr) as herdr, \
+                mock.patch.object(hibernate, "load_config",
+                                  return_value=dict(hibernate.DEFAULTS)), \
+                mock.patch.object(hibernate, "transcript_age_minutes",
+                                  return_value=60), \
+                mock.patch.object(hibernate, "toast"):
+            hibernate.cmd_keep()
+            self.assertEqual(hibernate.kept_ids(), {self.SID})
+            label = [c.args for c in herdr.call_args_list
+                     if c.args[1] == "report-metadata"][-1][-1]
+            self.assertTrue(label.startswith("🔖"))
+            hibernate.cmd_keep()
+        self.assertEqual(hibernate.kept_ids(), set())
+
+    def test_running_kept_chat_shows_a_bookmark(self):
+        pane = {"pane_id": "w1:p5", "agent": "claude",
+                "agent_session": {"value": self.SID}}
+        with mock.patch.object(hibernate, "herdr") as herdr:
+            hibernate.show_kept(pane, {self.SID})
+        self.assertEqual(herdr.call_args.args[-2:], ("--display-agent", "🔖 claude"))
+
+    def test_unkept_chat_loses_its_bookmark_and_others_are_left_alone(self):
+        pane = {"pane_id": "w1:p5", "agent": "claude", "display_agent": "🔖 claude",
+                "agent_session": {"value": self.SID}}
+        with mock.patch.object(hibernate, "herdr") as herdr:
+            hibernate.show_kept(pane, set())
+            self.assertEqual(herdr.call_args.args[-1], "--clear-display-agent")
+            herdr.reset_mock()
+            hibernate.show_kept(dict(pane, display_agent="custom"), set())
+            hibernate.show_kept(dict(pane, display_agent="🔖 claude"), {self.SID})
+            hibernate.show_kept({"pane_id": "w1:p6", "agent": hibernate.SLEEP_AGENT},
+                                {self.SID})
+        herdr.assert_not_called()
+
+    def test_keep_on_a_running_chat_marks_it_at_once(self):
+        pane = {"pane_id": "w1:p5", "agent": "claude",
+                "agent_session": {"value": self.SID}}
+
+        def fake_herdr(*args):
+            return {"pane": pane} if args[:2] == ("pane", "current") else {}
+
+        with mock.patch.object(hibernate, "herdr", side_effect=fake_herdr) as herdr, \
+                mock.patch.object(hibernate, "toast"):
+            hibernate.cmd_keep()
+        self.assertEqual(hibernate.kept_ids(), {self.SID})
+        self.assertIn("🔖 claude", herdr.call_args.args)
+
+    def test_keep_on_a_chat_that_just_woke_marks_it_as_running(self):
+        hibernate.save_state({"w1:p5": {"uuid": self.SID, "agent": "claude",
+                                         "label": "Old work"}})
+        pane = {"pane_id": "w1:p5", "agent": "claude",
+                "agent_session": {"value": self.SID}}
+
+        def fake_herdr(*args):
+            return {"pane": pane} if args[:2] == ("pane", "current") else {}
+
+        with mock.patch.object(hibernate, "herdr", side_effect=fake_herdr) as herdr, \
+                mock.patch.object(hibernate, "toast"):
+            hibernate.cmd_keep()
+        self.assertEqual(hibernate.kept_ids(), {self.SID})
+        self.assertNotIn("report-agent", [c.args[1] for c in herdr.call_args_list])
+        self.assertIn("🔖 claude", herdr.call_args.args)
+
+    def test_groups_and_chats_sort_by_last_use(self):
+        entries = [
+            {"uuid": "a", "workspace_id": "w1", "used": "2026-01-01 00:00:00"},
+            {"uuid": "b", "workspace_id": "w2", "used": "2026-03-01 00:00:00"},
+            {"uuid": "c", "workspace_id": "w1", "used": "2026-02-01 00:00:00"},
+        ]
+        groups = hibernate.settled_groups(entries, {"w1": "app", "w2": "KB"})
+        self.assertEqual([(n, [e["uuid"] for e in es]) for n, es in groups],
+                         [("KB", ["b"]), ("app", ["c", "a"])])
+
+    def test_gone_workspace_groups_by_folder(self):
+        groups = hibernate.settled_groups(
+            [{"uuid": "a", "workspace_id": "gone", "cwd": "/srv/project"}], {})
+        self.assertEqual(groups[0][0], "project")
+
+    def test_pinned_tab_is_never_auto_settled(self):
+        _, calls = self._auto(age_days=30, tab_label="💤 📌 Keep me")
+        self.assertEqual(calls, [])
+
+    def test_auto_settle_respects_dry_run_and_zero_days(self):
+        _, calls = self._auto(age_days=30, dry_run=True)
+        self.assertEqual(calls, [])
+        _, calls = self._auto(age_days=30, AUTO_SETTLE_AFTER_DAYS="0")
+        self.assertEqual(calls, [])
+        self.assertEqual(self._settled(), [])
+
+    def test_watcher_settles_a_hibernated_tab_whose_close_it_missed(self):
+        state = {"w1:p1": {"uuid": self.SID, "tab_id": "w1:t1", "label": "x",
+                           "missing_since": "2000-01-01 00:00:00"}}
+        hibernate.save_state(state)
+        with mock.patch.object(hibernate, "gc_stub_files"), \
+                mock.patch.object(hibernate, "herdr"):
+            hibernate.restore_records([], {}, state)
+        self.assertEqual([e["uuid"] for e in self._settled()], [self.SID])
+
+
+class ViewTests(unittest.TestCase):
+    """F8 cycles the agents list: all -> running -> hibernated -> all."""
+
+    def _step(self, active):
+        calls = []
+
+        def fake_api(method, params):
+            calls.append((method, params))
+            if params.get("source", "").endswith("-probe"):
+                return active
+            return {}
+
+        with mock.patch.object(hibernate, "herdr_api", side_effect=fake_api):
+            hibernate.cmd_view()
+        return calls[-1]
+
+    def _ours(self, label):
+        return {"active": True, "source": hibernate.SLEEP_SOURCE, "label": label}
+
+    def test_no_filter_steps_to_running(self):
+        method, params = self._step({"active": False})
+        self.assertEqual(method, "agent.view.set")
+        self.assertEqual(params["label"], "running")
+
+    def test_running_steps_to_hibernated(self):
+        method, params = self._step(self._ours("running"))
+        self.assertEqual(params["label"], "hibernated")
+        self.assertEqual(params["filter"]["value"], hibernate.SLEEP_AGENT)
+
+    def test_hibernated_steps_back_to_all(self):
+        method, params = self._step(self._ours("hibernated"))
+        self.assertEqual((method, params),
+                         ("agent.view.clear", {"source": hibernate.SLEEP_SOURCE}))
+
+    def test_another_tools_filter_counts_as_all(self):
+        method, params = self._step(
+            {"active": True, "source": "someone-else", "label": "hibernated"})
+        self.assertEqual(params["label"], "running")
 
 
 class WatcherGuardTests(unittest.TestCase):
@@ -272,8 +663,17 @@ class WatcherGuardTests(unittest.TestCase):
             self.assertEqual(hibernate.agent_age_minutes(4242, "w1:p1"), 7.0)
 
     def test_label_awake_writes_the_stamp_even_without_a_record(self):
-        hibernate.cmd_label_awake("w1:p1")
+        with mock.patch.object(hibernate, "herdr"):
+            hibernate.cmd_label_awake("w1:p1")
         self.assertTrue(os.path.exists(hibernate.resume_stamp_path("w1:p1")))
+
+    def test_label_awake_takes_the_pane_off_the_sleep_list(self):
+        with mock.patch.object(hibernate, "herdr") as herdr:
+            hibernate.cmd_label_awake("w1:p1")
+        calls = [c.args for c in herdr.call_args_list]
+        self.assertIn(("pane", "release-agent", "w1:p1", "--source",
+                       hibernate.SLEEP_SOURCE, "--agent",
+                       hibernate.SLEEP_AGENT), calls)
 
     def test_stamp_survives_resume_but_not_the_panes_closing(self):
         hibernate.write_resume_stamp("w1:p1")
