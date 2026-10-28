@@ -679,6 +679,17 @@ def proc_uptime_minutes(pid):
         return None
 
 
+def pid_alive(pid):
+    """True while pid exists — portable, unlike checking /proc."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    return True
+
+
 def descendants(root, procs):
     kids = {}
     for pid, (ppid, _, _) in procs.items():
@@ -1211,11 +1222,11 @@ def kill_tree(root, grace_seconds, protected, bin_name):
             pass
     deadline = time.time() + grace_seconds
     while time.time() < deadline:
-        if not any(os.path.exists("/proc/%d" % p) for p in targets):
+        if not any(pid_alive(p) for p in targets):
             break
         time.sleep(0.25)
     for pid in targets:
-        if os.path.exists("/proc/%d" % pid):
+        if pid_alive(pid):
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -2601,8 +2612,8 @@ fi
 """ % SHELL_HOOK_MARK
 
 
-def install_shell_hook(rc=os.path.expanduser("~/.bashrc")):
-    """Add (or refresh) the .bashrc hook that re-arms stubs in fresh shells."""
+def _install_shell_hook(rc):
+    """Add (or refresh) the stub hook in one shell rc file."""
     try:
         with open(rc, encoding="utf-8") as fh:
             body = fh.read()
@@ -2622,6 +2633,20 @@ def install_shell_hook(rc=os.path.expanduser("~/.bashrc")):
     with open(rc, "w", encoding="utf-8") as fh:
         fh.write(body)
     return "%s shell hook in %s" % (action, rc)
+
+
+def install_shell_hook():
+    """Install the hook in each interactive rc the user's shells may read.
+
+    Panes run the user's own shell: bash reads ~/.bashrc, zsh reads
+    ~/.zshrc (the default on macOS). Cover .bashrc unconditionally and
+    .zshrc when it exists — the hook body is valid in both.
+    """
+    rcs = [os.path.expanduser("~/.bashrc")]
+    zshrc = os.path.expanduser("~/.zshrc")
+    if os.path.exists(zshrc):
+        rcs.append(zshrc)
+    return "; ".join(_install_shell_hook(rc) for rc in rcs)
 
 
 def cmd_status():
@@ -2686,6 +2711,13 @@ def watcher_pid():
         with open("/proc/%d/cmdline" % pid, "rb") as fh:
             if b"herdr-hibernate" in fh.read():
                 return pid
+    except OSError:
+        pass
+    try:  # no /proc (macOS): identify the pid by its args instead
+        out = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout
+        if "herdr-hibernate" in out:
+            return pid
     except OSError:
         pass
     return None
@@ -2961,7 +2993,7 @@ def cmd_uninstall():
     if os.path.exists(PID_FILE):
         try:
             pid = int(open(PID_FILE).read().strip())
-            if os.path.exists("/proc/%d" % pid):
+            if pid_alive(pid):
                 os.kill(pid, signal.SIGTERM)
                 print("stopped watcher (pid %d)" % pid)
                 stopped = True
